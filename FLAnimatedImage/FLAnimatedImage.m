@@ -179,6 +179,7 @@ static NSHashTable *allAnimatedImagesWeak;
 
 - (instancetype)initWithAnimatedGIFData:(NSData *)data optimalFrameCacheSize:(NSUInteger)optimalFrameCacheSize predrawingEnabled:(BOOL)isPredrawingEnabled
 {
+    //1，数据合理性判断
     // Early return if no data supplied!
     BOOL hasData = ([data length] > 0);
     if (!hasData) {
@@ -188,6 +189,7 @@ static NSHashTable *allAnimatedImagesWeak;
     
     self = [super init];
     if (self) {
+        //2 初始化变量
         // Do one-time initializations of `readonly` properties directly to ivar to prevent implicit actions and avoid need for private `readwrite` property overrides.
         
         // Keep a strong reference to `data` and expose it read-only publicly.
@@ -196,10 +198,11 @@ static NSHashTable *allAnimatedImagesWeak;
         _predrawingEnabled = isPredrawingEnabled;
         
         // Initialize internal data structures
-        _cachedFramesForIndexes = [[NSMutableDictionary alloc] init];
-        _cachedFrameIndexes = [[NSMutableIndexSet alloc] init];
-        _requestedFrameIndexes = [[NSMutableIndexSet alloc] init];
+        _cachedFramesForIndexes = [[NSMutableDictionary alloc] init];////key->帧图片在GIF动画的索引位置 value->单帧图片
+        _cachedFrameIndexes = [[NSMutableIndexSet alloc] init];//缓存的帧图片在GIF动画的索引位置集合
+        _requestedFrameIndexes = [[NSMutableIndexSet alloc] init];//需要生产者生产的的帧图片的索引位置
 
+        //3，创建图片数据
         // Note: We could leverage `CGImageSourceCreateWithURL` too to add a second initializer `-initWithAnimatedGIFContentsOfURL:`.
         _imageSource = CGImageSourceCreateWithData((__bridge CFDataRef)data,
                                                    (__bridge CFDictionaryRef)@{(NSString *)kCGImageSourceShouldCache: @NO});
@@ -209,6 +212,7 @@ static NSHashTable *allAnimatedImagesWeak;
             return nil;
         }
         
+        //4，判断是否是gif！
         // Early return if not GIF!
         CFStringRef imageSourceContainerType = CGImageSourceGetType(_imageSource);
         BOOL isGIFData = UTTypeConformsTo(imageSourceContainerType, kUTTypeGIF);
@@ -217,6 +221,7 @@ static NSHashTable *allAnimatedImagesWeak;
             return nil;
         }
         
+        //5, 取出gif的信息
         // Get `LoopCount`
         // Note: 0 means repeating the animation indefinitely.
         // Image properties example:
@@ -228,19 +233,24 @@ static NSHashTable *allAnimatedImagesWeak;
         //     };
         // }
         NSDictionary *imageProperties = (__bridge_transfer NSDictionary *)CGImageSourceCopyProperties(_imageSource, NULL);
+        //获取循环次数
         _loopCount = [[[imageProperties objectForKey:(id)kCGImagePropertyGIFDictionary] objectForKey:(id)kCGImagePropertyGIFLoopCount] unsignedIntegerValue];
         
+        //遍历图片
         // Iterate through frame images
-        size_t imageCount = CGImageSourceGetCount(_imageSource);
-        NSUInteger skippedFrameCount = 0;
-        NSMutableDictionary *delayTimesForIndexesMutable = [NSMutableDictionary dictionaryWithCapacity:imageCount];
+        size_t imageCount = CGImageSourceGetCount(_imageSource); //获取一共多少张图片
+        NSUInteger skippedFrameCount = 0; //用于记录GIF动画中异常帧的数量
+        
+        NSMutableDictionary *delayTimesForIndexesMutable = [NSMutableDictionary dictionaryWithCapacity:imageCount];  //记录GIF动画中每帧图片的显示时间
         for (size_t i = 0; i < imageCount; i++) {
             @autoreleasepool {
+                // 6、取出帧图片
                 CGImageRef frameImageRef = CGImageSourceCreateImageAtIndex(_imageSource, i, NULL);
                 if (frameImageRef) {
                     UIImage *frameImage = [UIImage imageWithCGImage:frameImageRef];
                     // Check for valid `frameImage` before parsing its properties as frames can be corrupted (and `frameImage` even `nil` when `frameImageRef` was valid).
                     if (frameImage) {
+                        //设置第一帧图片
                         // Set poster image
                         if (!self.posterImage) {
                             _posterImage = frameImage;
@@ -282,6 +292,7 @@ static NSHashTable *allAnimatedImagesWeak;
                                 delayTime = @(kDelayTimeIntervalDefault);
                             } else {
                                 FLLog(FLLogLevelInfo, @"Falling back to preceding delay time for frame %zu %@ because none found in GIF properties %@", i, frameImage, frameProperties);
+                                //取上一帧
                                 delayTime = delayTimesForIndexesMutable[@(i - 1)];
                             }
                         }
@@ -303,6 +314,7 @@ static NSHashTable *allAnimatedImagesWeak;
                 }
             }
         }
+        //每帧的持续时间数组  &  帧数
         _delayTimesForIndexes = [delayTimesForIndexesMutable copy];
         _frameCount = imageCount;
         
@@ -316,6 +328,7 @@ static NSHashTable *allAnimatedImagesWeak;
             // We have multiple frames, rock on!
         }
         
+        //动画缓存策略
         // If no value is provided, select a default based on the GIF.
         if (optimalFrameCacheSize == 0) {
             // Calculate the optimal frame cache size: try choosing a larger buffer window depending on the predicted image size.
@@ -378,6 +391,7 @@ static NSHashTable *allAnimatedImagesWeak;
 // Note: both consumer and producer are throttled: consumer by frame timings and producer by the available memory (max buffer window size).
 - (UIImage *)imageLazilyCachedAtIndex:(NSUInteger)index
 {
+    //防止越界
     // Early return if the requested index is beyond bounds.
     // Note: We're comparing an index with a count and need to bail on greater than or equal to.
     if (index >= self.frameCount) {
@@ -385,6 +399,7 @@ static NSHashTable *allAnimatedImagesWeak;
         return nil;
     }
     
+    //2、记录当前要生产的帧图片在GIF动画中的索引位置
     // Remember requested frame index, this influences what we should cache next.
     self.requestedFrameIndex = index;
 #if defined(DEBUG) && DEBUG
@@ -394,10 +409,13 @@ static NSHashTable *allAnimatedImagesWeak;
 #endif
     
     // Quick check to avoid doing any work if we already have all possible frames cached, a common case.
+    //判断图片是否全部缓存下来。 如果没有，根据缓存策略进行缓存
     if ([self.cachedFrameIndexes count] < self.frameCount) {
         // If we have frames that should be cached but aren't and aren't requested yet, request them.
         // Exclude existing cached frames, frames already requested, and specially cached poster image.
+        //根据缓存策略得到接下来需要缓存的帧图片索引，
         NSMutableIndexSet *frameIndexesToAddToCacheMutable = [self frameIndexesToCache];
+        // 5、除去已经缓存下来的帧图片索引
         [frameIndexesToAddToCacheMutable removeIndexes:self.cachedFrameIndexes];
         [frameIndexesToAddToCacheMutable removeIndexes:self.requestedFrameIndexes];
         [frameIndexesToAddToCacheMutable removeIndex:self.posterImageFrameIndex];
@@ -405,11 +423,13 @@ static NSHashTable *allAnimatedImagesWeak;
         
         // Asynchronously add frames to our cache.
         if ([frameIndexesToAddToCache count] > 0) {
+            //// 6、生产帧图片
             [self addFrameIndexesToCache:frameIndexesToAddToCache];
         }
     }
     
     // Get the specified image.
+     // 7、取出帧图片
     UIImage *image = self.cachedFramesForIndexes[@(index)];
     
     // Purge if needed based on the current playhead position.
